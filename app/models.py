@@ -36,3 +36,12 @@ class BatchPublishRequest(BaseModel):
 
     documents: list[BatchItem] = Field(default_factory=list)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class WithdrawRequest(BaseModel):
+    """撤回已发布版本：原因必填（去空白后为空则在路由内拒绝）。
+
+    撤回是永久且幂等的：重复撤回同一版本返回首次记录，不改写原因。
+    """
+
+    reason: str = Field(max_length=500)

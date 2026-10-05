@@ -1,4 +1,4 @@
-"""HTTP API：上传、标注（乐观锁修订）、发布（事务内涂实）、公开读取。"""
+"""HTTP API：上传、标注（乐观锁修订）、发布（事务内涂实）、撤回、公开读取。"""
 from __future__ import annotations
 
 import hashlib
@@ -21,7 +21,7 @@ from .imaging import (
     load_oriented,
     render_publication,
 )
-from .models import AnnotationsPut, BatchPublishRequest
+from .models import AnnotationsPut, BatchPublishRequest, WithdrawRequest
 
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg"}
 
@@ -71,6 +71,26 @@ def _rect_out(row: Any) -> dict:
     }
 
 
+def _pub_entry(row: Any, keys: list[str]) -> dict:
+    """发布记录条目：原字段按序输出，末尾追加撤回状态三字段。
+
+    查询须以 LEFT JOIN 带出 w_at / w_reason 两列（见各列表端点）。
+    """
+    out = {k: row[k] for k in keys}
+    out["withdrawn"] = row["w_at"] is not None
+    out["withdrawn_at"] = row["w_at"]
+    out["withdrawal_reason"] = row["w_reason"]
+    return out
+
+
+# 列表查询共用的撤回状态联表片段
+_WITHDRAWAL_JOIN = (
+    " LEFT JOIN publication_withdrawals w"
+    " ON w.doc_id = {t}.doc_id AND w.version = {t}.version"
+)
+_WITHDRAWAL_COLS = ", w.withdrawn_at AS w_at, w.reason AS w_reason"
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
 
@@ -95,6 +115,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row is None:
             _error(404, "document_not_found", f"document '{doc_id}' does not exist")
         return row
+
+    def _get_publication(conn: Any, doc_id: str, version: int) -> Any:
+        """取发布记录；未知文档/版本按既有的不存在错误返回。"""
+        pub = conn.execute(
+            "SELECT * FROM publications WHERE doc_id = ? AND version = ?",
+            (doc_id, version),
+        ).fetchone()
+        if pub is None:
+            exists = conn.execute(
+                "SELECT 1 FROM documents WHERE id = ?", (doc_id,)
+            ).fetchone()
+            if exists is None:
+                _error(
+                    404, "document_not_found", f"document '{doc_id}' does not exist"
+                )
+            _error(
+                404,
+                "unknown_version",
+                f"document '{doc_id}' has no publication version {version}",
+            )
+        return pub
+
+    def _ensure_not_withdrawn(conn: Any, doc_id: str, version: int) -> None:
+        """已撤回版本对公开面不可见（410），不返回成品与遮盖详情。
+
+        撤回只登记记录、不删除成品文件：生效前已开始的下载因此能够
+        完成，只有新发起的公开读取被拒绝。
+        """
+        row = conn.execute(
+            "SELECT 1 FROM publication_withdrawals"
+            " WHERE doc_id = ? AND version = ?",
+            (doc_id, version),
+        ).fetchone()
+        if row is not None:
+            _error(
+                410,
+                "publication_withdrawn",
+                f"document '{doc_id}' publication version {version} has been"
+                " withdrawn and is no longer publicly available",
+            )
 
     # ---------------- 基本 ----------------
 
@@ -173,8 +233,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with read_tx(settings.db_path) as conn:
             doc = _get_doc(conn, doc_id)
             pubs = conn.execute(
-                "SELECT version, annotation_revision, output_sha256, created_at"
-                " FROM publications WHERE doc_id = ? ORDER BY version",
+                "SELECT p.version, p.annotation_revision, p.output_sha256,"
+                " p.created_at" + _WITHDRAWAL_COLS +
+                " FROM publications p" + _WITHDRAWAL_JOIN.format(t="p") +
+                " WHERE p.doc_id = ? ORDER BY p.version",
                 (doc_id,),
             ).fetchall()
         return {
@@ -186,7 +248,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "original_sha256": doc["original_sha256"],
             "annotation_revision": doc["annotation_revision"],
             "created_at": doc["created_at"],
-            "publications": [dict(p) for p in pubs],
+            "publications": [
+                _pub_entry(
+                    p, ["version", "annotation_revision", "output_sha256",
+                        "created_at"]
+                )
+                for p in pubs
+            ],
         }
 
     # ---------------- 标注（修订号乐观锁） ----------------
@@ -347,12 +415,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with read_tx(settings.db_path) as conn:
             _get_doc(conn, doc_id)
             pubs = conn.execute(
-                "SELECT version, annotation_revision, original_sha256,"
-                " output_sha256, created_at"
-                " FROM publications WHERE doc_id = ? ORDER BY version",
+                "SELECT p.version, p.annotation_revision, p.original_sha256,"
+                " p.output_sha256, p.created_at" + _WITHDRAWAL_COLS +
+                " FROM publications p" + _WITHDRAWAL_JOIN.format(t="p") +
+                " WHERE p.doc_id = ? ORDER BY p.version",
                 (doc_id,),
             ).fetchall()
-        return {"doc_id": doc_id, "publications": [dict(p) for p in pubs]}
+        return {
+            "doc_id": doc_id,
+            "publications": [
+                _pub_entry(
+                    p, ["version", "annotation_revision", "original_sha256",
+                        "output_sha256", "created_at"]
+                )
+                for p in pubs
+            ],
+        }
 
     # ---------------- 批次发布（整批原子） ----------------
 
@@ -597,44 +675,94 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f"publication batch '{batch_id}' does not exist",
                 )
             rows = conn.execute(
-                "SELECT position, doc_id, version, annotation_revision,"
-                " original_sha256, output_sha256"
-                " FROM batch_publications WHERE batch_id = ? ORDER BY position",
+                "SELECT bp.position, bp.doc_id, bp.version, bp.annotation_revision,"
+                " bp.original_sha256, bp.output_sha256" + _WITHDRAWAL_COLS +
+                " FROM batch_publications bp" + _WITHDRAWAL_JOIN.format(t="bp") +
+                " WHERE bp.batch_id = ? ORDER BY bp.position",
                 (batch_id,),
             ).fetchall()
         return {
             "batch_id": batch["id"],
             "created_at": batch["created_at"],
             "count": len(rows),
-            "documents": [dict(r) for r in rows],  # 顺序与原请求一致
+            "documents": [
+                _pub_entry(
+                    r, ["position", "doc_id", "version", "annotation_revision",
+                        "original_sha256", "output_sha256"]
+                )
+                for r in rows
+            ],  # 顺序与原请求一致
         }
 
-    # ---------------- 公开读取（只暴露发布版，不暴露原图） ----------------
+    # ---------------- 版本撤回（永久，幂等） ----------------
 
-    def _get_publication(conn: Any, doc_id: str, version: int) -> Any:
-        pub = conn.execute(
-            "SELECT * FROM publications WHERE doc_id = ? AND version = ?",
-            (doc_id, version),
-        ).fetchone()
-        if pub is None:
-            exists = conn.execute(
-                "SELECT 1 FROM documents WHERE id = ?", (doc_id,)
-            ).fetchone()
-            if exists is None:
+    def _withdrawal_out(doc_id: str, version: int, row: Any) -> dict:
+        return {
+            "doc_id": doc_id,
+            "version": version,
+            "withdrawn": row is not None,
+            "withdrawn_at": row["withdrawn_at"] if row is not None else None,
+            "withdrawal_reason": row["reason"] if row is not None else None,
+        }
+
+    @app.post(
+        "/documents/{doc_id}/publications/{version}/withdraw",
+        status_code=201,
+    )
+    def withdraw_publication(
+        doc_id: str, version: int, body: WithdrawRequest, response: Response
+    ) -> dict:
+        # 存在性校验、原因校验、"查重 -> 插入"在同一个 BEGIN IMMEDIATE
+        # 写事务内完成：与发布、标注修改、其他撤回互斥串行，并发重复撤回
+        # 恰好一个创建记录（201），其余返回首次记录（200）；任何失败整体
+        # 回滚，不留下部分撤回记录。撤回只插入 publication_withdrawals 行，
+        # 不删除发布记录与成品文件，版本号也不会被后续发布复用。
+        with write_tx(settings.db_path) as conn:
+            _get_publication(conn, doc_id, version)  # 未知文档/版本 -> 404
+            reason = body.reason.strip()
+            if not reason:
                 _error(
-                    404, "document_not_found", f"document '{doc_id}' does not exist"
+                    400,
+                    "reason_required",
+                    "withdrawal reason must be non-empty",
                 )
-            _error(
-                404,
-                "unknown_version",
-                f"document '{doc_id}' has no publication version {version}",
+            existing = conn.execute(
+                "SELECT reason, withdrawn_at FROM publication_withdrawals"
+                " WHERE doc_id = ? AND version = ?",
+                (doc_id, version),
+            ).fetchone()
+            if existing is not None:
+                # 重复撤回：返回首次记录，不改写原因与时间
+                response.status_code = 200
+                return _withdrawal_out(doc_id, version, existing)
+            now = _utcnow()
+            conn.execute(
+                "INSERT INTO publication_withdrawals"
+                " (doc_id, version, reason, withdrawn_at) VALUES (?,?,?,?)",
+                (doc_id, version, reason, now),
             )
-        return pub
+        return _withdrawal_out(
+            doc_id, version, {"reason": reason, "withdrawn_at": now}
+        )
+
+    @app.get("/documents/{doc_id}/publications/{version}/withdrawal")
+    def get_withdrawal(doc_id: str, version: int) -> dict:
+        with read_tx(settings.db_path) as conn:
+            _get_publication(conn, doc_id, version)  # 未知文档/版本 -> 404
+            row = conn.execute(
+                "SELECT reason, withdrawn_at FROM publication_withdrawals"
+                " WHERE doc_id = ? AND version = ?",
+                (doc_id, version),
+            ).fetchone()
+        return _withdrawal_out(doc_id, version, row)
+
+    # ---------------- 公开读取（只暴露发布版，不暴露原图） ----------------
 
     @app.get("/publications/{doc_id}/{version}")
     def get_publication(doc_id: str, version: int) -> dict:
         with read_tx(settings.db_path) as conn:
             pub = _get_publication(conn, doc_id, version)
+            _ensure_not_withdrawn(conn, doc_id, version)
             rects = conn.execute(
                 "SELECT x, y, w, h, reason FROM annotation_rects"
                 " WHERE doc_id = ? AND revision = ? ORDER BY idx",
@@ -654,6 +782,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_publication_image(doc_id: str, version: int) -> FileResponse:
         with read_tx(settings.db_path) as conn:
             pub = _get_publication(conn, doc_id, version)
+            _ensure_not_withdrawn(conn, doc_id, version)
         path = pub["output_path"]
         if not os.path.exists(path):
             _error(

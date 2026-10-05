@@ -3,7 +3,9 @@
 档案员上传 PNG/JPEG 原图，在 **EXIF 旋正后的像素坐标系** 上标注敏感矩形及原因；
 发布时把当前标注矩形不可逆涂实为纯黑，生成剥离元数据的独立 PNG，并固化
 原图摘要、标注修订号与成品摘要。已发布成品不随后续标注变化而改变；
-公开读取只暴露发布版与遮盖信息，永不返回原图。
+公开读取只暴露发布版与遮盖信息，永不返回原图。已发布版本发现遮盖遗漏时，
+可凭文档 ID、版本号与非空原因**永久撤回**：公开读取立即拒绝，发布记录、
+成品文件与版本号序列全部保留。
 
 技术栈：Python 3.11+ · FastAPI · Pillow · SQLite（WAL）
 
@@ -52,9 +54,11 @@ python -m pytest tests/ -q
 | GET  | `/documents/{doc_id}/annotations` | 当前标注修订号与矩形 |
 | PUT  | `/documents/{doc_id}/annotations` | 整体替换标注，须携带当前修订号 |
 | POST | `/documents/{doc_id}/publish` | 按当前标注发布新版本（涂实+去元数据 PNG） |
-| GET  | `/documents/{doc_id}/publications` | 发布版本列表 |
+| GET  | `/documents/{doc_id}/publications` | 发布版本列表（含撤回状态） |
+| POST | `/documents/{doc_id}/publications/{version}/withdraw` | 凭非空原因**永久撤回**该版本（重复撤回返回首次记录） |
+| GET  | `/documents/{doc_id}/publications/{version}/withdrawal` | 查询该版本的撤回状态、时间与原因 |
 | POST | `/publication-batches` | **同批次发布 2～20 份文档**（原子：全成功或整批失败）；可选 `idempotency_key` 防重发 |
-| GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致） |
+| GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致，含撤回状态） |
 | GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因 |
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG |
 
@@ -82,11 +86,23 @@ curl -s -X POST $BASE/documents/$DOC_ID/publish
 # 4) 公开读取（不含原图）
 curl -s $BASE/publications/$DOC_ID/1          # 版本元数据 + 遮盖坐标/原因
 curl -s -OJ $BASE/publications/$DOC_ID/1/image # 发布版 PNG
+
+# 5) 发现遮盖遗漏：凭文档 ID + 版本号 + 非空原因永久撤回 v1
+curl -s -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"遮盖遗漏：右下角工号未遮盖"}'
+# -> HTTP 201 {"withdrawn":true,"withdrawn_at":"...","withdrawal_reason":"...",...}
+# 重复撤回 -> HTTP 200 返回首次记录，原因不被改写
+
+# 6) 撤回后公开读取返回 410；详情/列表仍保留记录并标识撤回状态
+curl -s $BASE/publications/$DOC_ID/1           # 410 publication_withdrawn
+curl -s $BASE/documents/$DOC_ID/publications   # v1 条目 withdrawn=true
 ```
 
 完整可运行脚本：`examples/demo.sh`（单份流程）、`examples/demo_batch.sh`
-（批次发布流程）与 `examples/demo_idempotency.sh`（批次幂等键流程）；
-先启动服务，再执行 `bash examples/demo_idempotency.sh`。
+（批次发布流程）、`examples/demo_idempotency.sh`（批次幂等键流程）与
+`examples/demo_withdrawal.sh`（版本撤回流程）；
+先启动服务，再执行 `bash examples/demo_withdrawal.sh`。
 
 ## 同批次发布（2～20 份，整批原子）
 
@@ -200,6 +216,39 @@ curl -sS -X POST $BASE/publication-batches \
 
 端到端示例：`bash examples/demo_idempotency.sh`。
 
+## 版本撤回（永久，幂等）
+
+已发布版本发现遮盖遗漏时，档案员凭**文档 ID + 版本号 + 非空原因**永久撤回：
+
+```bash
+BASE=http://localhost:8000
+curl -sS -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"遮盖遗漏：右下角工号未遮盖"}'
+# 首次撤回 HTTP 201：
+# {"doc_id":"…","version":1,"withdrawn":true,
+#  "withdrawn_at":"2026-10-05T…+00:00","withdrawal_reason":"遮盖遗漏：…"}
+```
+
+- **永久且保留记录**：撤回只登记撤回记录，不删除 `publications` 行、成品
+  文件或批次记录，版本号不复用——后续单份/批次发布继续 `MAX(version)+1`。
+- **公开面立即生效**：撤回后新发起的 `GET /publications/{doc}/{version}` 与
+  `.../image` 返回 **410 `publication_withdrawn`**，不返回成品与遮盖详情；
+  成品文件保留在磁盘上，撤回生效前已开始的下载允许完成。
+- **幂等**：重复撤回返回首次记录（HTTP 200），撤回时间与原因不被改写；
+  并发撤回与发布在同一写事务内串行化，恰好一个请求创建记录，
+  失败不留部分撤回记录。
+- **可查询**：`GET /documents/{doc_id}/publications/{version}/withdrawal`
+  返回该版本的撤回状态、时间与原因；文档详情、发布列表、批次查询的每个
+  版本条目末尾追加 `withdrawn`/`withdrawn_at`/`withdrawal_reason`
+  （原字段及顺序不变，未撤回为 `false`/`null`/`null`）。
+- **错误**：未知文档 404 `document_not_found`、未知版本 404
+  `unknown_version`、空白原因 400 `reason_required`。
+- **批次幂等键重放**仍原样返回首次保存的响应（HTTP 200），
+  但不能恢复已撤回版本的公开访问。
+
+端到端示例：`bash examples/demo_withdrawal.sh`。
+
 
 ## 错误响应
 
@@ -211,10 +260,11 @@ curl -sS -X POST $BASE/publication-batches \
 | 400 | `image_decode_failed` | 字节无法解码为图像（含截断/损坏） |
 | 400 | `empty_rectangle` | 矩形宽或高 ≤ 0 |
 | 400 | `rectangle_out_of_bounds` | 矩形越出旋正后图像边界 |
-| 400 | `reason_required` | 矩形未填写原因 |
+| 400 | `reason_required` | 矩形未填写原因；撤回原因为空白 |
 | 404 | `document_not_found` | 文档不存在（批次场景附 `position`/`doc_id`） |
 | 404 | `unknown_version` | 发布版本不存在 |
 | 404 | `batch_not_found` | 批次标识不存在 |
+| 410 | `publication_withdrawn` | 公开读取已撤回的版本（不返回成品与遮盖详情） |
 | 400 | `invalid_batch_size` | 批次文档数不在 2～20（附 `count`） |
 | 400 | `duplicate_document_in_batch` | 批次内文档 ID 重复（附 `position`/`doc_id`） |
 | 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次场景另附 `position`/`doc_id`/`supplied_revision`） |
@@ -247,10 +297,17 @@ curl -sS -X POST $BASE/publication-batches \
   最多发布一次。
 - **不可变性**：标注矩形按 `(doc_id, revision)` 追加存储、历史修订永不改写；
   发布版 PNG 落盘后不改动，后续标注变化不影响已发布成品（批次产物同样如此）。
+- **版本撤回**：撤回的"校验 → 查重 → 登记"在同一个 `BEGIN IMMEDIATE`
+  写事务内完成，与标注修改、单份/批次发布、其他撤回互斥串行；撤回记录按
+  `(doc_id, version)` 主键追加、永不改写——重复撤回（含并发）命中主键直接
+  返回首次记录，恰好一个请求创建记录，失败整体回滚不留部分记录。撤回只插入
+  `publication_withdrawals` 行：`publications` 记录、成品文件与版本号序列全部
+  保留（后续发布继续 `MAX(version)+1`）；撤回生效后新发起的公开读取返回 410，
+  生效前已开始的下载因成品文件保留而允许完成。
 - **脱敏**：矩形区域以纯黑不可逆涂实；发布图重建为干净像素容器后另存为 PNG，
   不携带 EXIF/ICC/文本等任何原图元数据；无标注时也生成去元数据的发布版。
 - **公开面**：`/publications/...` 只返回发布版成品、遮盖坐标与原因及摘要值，
-  原图没有任何对外读取入口。
+  原图没有任何对外读取入口；已撤回版本返回 410，不再返回成品与遮盖详情。
 
 ## 目录结构
 
@@ -266,13 +323,35 @@ tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、�
                      #   原图不可读/写盘失败的整批回滚、版本交错、不可变性、并发
 tests/test_idempotency.py  # 10 个用例：幂等重放、内容绑定、冲突、各类失败不占键、
                            #   并发同键最多发布一次、无键请求兼容
+tests/test_withdrawal.py   # 10 个用例：撤回/查询、公开读取 410、幂等重复、
+                           #   列表标识、版本号不复用、批次重放不恢复、并发一致性
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
+examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（批次发布幂等键）
+## 本轮变动（版本撤回）
+
+- 新增 `POST /documents/{doc_id}/publications/{version}/withdraw`：凭非空原因
+  永久撤回已发布版本（首次 201；重复撤回 200 返回首次记录，不改写原因与时间）；
+  新增 `GET /documents/{doc_id}/publications/{version}/withdrawal` 查询该版本的
+  撤回状态、时间与原因。未知文档/版本沿用 404 `document_not_found`/
+  `unknown_version`，空白原因 400 `reason_required`。
+- 新增表 `publication_withdrawals`（`(doc_id, version)` 主键、原因、撤回时间）；
+  旧数据卷启动时自动建表（`CREATE TABLE IF NOT EXISTS` 轻量迁移）。
+- 撤回生效后，新发起的公开元数据与图片读取返回 410 `publication_withdrawn`，
+  不返回成品与遮盖详情；发布记录、成品文件与版本号序列保留，后续单份/批次
+  发布继续原序列；生效前已开始的下载允许完成。
+- 文档详情、发布列表、批次查询的版本条目末尾追加
+  `withdrawn`/`withdrawn_at`/`withdrawal_reason`，原字段及顺序不变。
+- 批次幂等键重放仍返回首次保存的响应，但不能恢复撤回版本的公开访问；
+  并发撤回与发布在同一写事务内串行化，失败不留部分撤回记录。
+- 上传、标注、单份/批次发布、公开读取的既有路由、请求与响应字段均未改动，
+  行为完全兼容。
+
+## 历史变动（批次发布幂等键）
 
 - `POST /publication-batches` 新增可选字段 `idempotency_key`（1～128 字符，
   调用方保证全局唯一），与按请求顺序排列的 `(doc_id, expected_revision)` 绑定。

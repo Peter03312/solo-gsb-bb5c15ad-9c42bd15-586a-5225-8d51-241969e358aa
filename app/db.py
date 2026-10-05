@@ -13,6 +13,9 @@
 - 幂等键（batch_idempotency）与首次成功批次在同一事务内落库：键的
   检查-发布-登记被写锁串行化，并发重试最多发布一次；失败回滚时键记录
   一并撤销，调用方可用原键重试。
+- 撤回记录（publication_withdrawals）按 (doc_id, version) 追加存储、
+  永不改写：重复撤回命中主键直接返回首次记录；撤回只插入该表，
+  publications 行、成品文件与版本号序列全部保留。
 """
 from __future__ import annotations
 
@@ -81,6 +84,15 @@ CREATE TABLE IF NOT EXISTS batch_idempotency (
     batch_id     TEXT NOT NULL REFERENCES publication_batches(id),
     response     TEXT NOT NULL,             -- 首次成功的完整响应体（JSON，原样重放）
     created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publication_withdrawals (
+    doc_id       TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    reason       TEXT NOT NULL,             -- 首次撤回时的原因（重复撤回不改写）
+    withdrawn_at TEXT NOT NULL,             -- 首次撤回时间
+    PRIMARY KEY (doc_id, version),
+    FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
 );
 """
 
