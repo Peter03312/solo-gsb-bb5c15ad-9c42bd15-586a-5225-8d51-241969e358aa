@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .config import Settings
 from .db import init_db, read_tx, write_tx
@@ -21,7 +21,7 @@ from .imaging import (
     load_oriented,
     render_publication,
 )
-from .models import AnnotationsPut, BatchPublishRequest
+from .models import AnnotationsPut, BatchPublishRequest, WithdrawalRequest
 
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg"}
 
@@ -71,6 +71,28 @@ def _rect_out(row: Any) -> dict:
     }
 
 
+def _pub_list_item(row: Any) -> dict:
+    """发布列表/文档详情/批次清单中的版本条目。
+
+    保留各接口原有字段及顺序，仅在末尾追加撤回标识；批次条目额外保留
+    首部的 position/doc_id。
+    """
+    keys: list[str] = []
+    if "position" in row.keys():  # 批次清单：position, doc_id 在前
+        keys += ["position", "doc_id"]
+    keys += [
+        "version",
+        "annotation_revision",
+        "original_sha256",
+        "output_sha256",
+        "created_at",
+    ]
+    item: dict[str, Any] = {k: row[k] for k in keys if k in row.keys()}
+    item["withdrawn"] = bool(row["withdrawn"])
+    item["withdrawn_at"] = row["withdrawn_at"]
+    return item
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
 
@@ -83,7 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="档案影像脱敏发布服务",
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -173,8 +195,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with read_tx(settings.db_path) as conn:
             doc = _get_doc(conn, doc_id)
             pubs = conn.execute(
-                "SELECT version, annotation_revision, output_sha256, created_at"
-                " FROM publications WHERE doc_id = ? ORDER BY version",
+                "SELECT p.version, p.annotation_revision, p.output_sha256,"
+                " p.created_at, w.withdrawn_at IS NOT NULL AS withdrawn,"
+                " w.withdrawn_at"
+                " FROM publications p"
+                " LEFT JOIN publication_withdrawals w"
+                " ON w.doc_id = p.doc_id AND w.version = p.version"
+                " WHERE p.doc_id = ? ORDER BY p.version",
                 (doc_id,),
             ).fetchall()
         return {
@@ -186,7 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "original_sha256": doc["original_sha256"],
             "annotation_revision": doc["annotation_revision"],
             "created_at": doc["created_at"],
-            "publications": [dict(p) for p in pubs],
+            "publications": [_pub_list_item(p) for p in pubs],
         }
 
     # ---------------- 标注（修订号乐观锁） ----------------
@@ -347,12 +374,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with read_tx(settings.db_path) as conn:
             _get_doc(conn, doc_id)
             pubs = conn.execute(
-                "SELECT version, annotation_revision, original_sha256,"
-                " output_sha256, created_at"
-                " FROM publications WHERE doc_id = ? ORDER BY version",
+                "SELECT p.version, p.annotation_revision, p.original_sha256,"
+                " p.output_sha256, p.created_at, w.withdrawn_at IS NOT NULL AS"
+                " withdrawn, w.withdrawn_at"
+                " FROM publications p"
+                " LEFT JOIN publication_withdrawals w"
+                " ON w.doc_id = p.doc_id AND w.version = p.version"
+                " WHERE p.doc_id = ? ORDER BY p.version",
                 (doc_id,),
             ).fetchall()
-        return {"doc_id": doc_id, "publications": [dict(p) for p in pubs]}
+        return {"doc_id": doc_id, "publications": [_pub_list_item(p) for p in pubs]}
+
+    # ---------------- 发布版本永久撤回 ----------------
+
+    def _get_withdrawal(conn: Any, doc_id: str, version: int) -> Any:
+        return conn.execute(
+            "SELECT doc_id, version, reason, withdrawn_at"
+            " FROM publication_withdrawals"
+            " WHERE doc_id = ? AND version = ?",
+            (doc_id, version),
+        ).fetchone()
+
+    def _withdrawal_out(w: Any) -> dict:
+        return {
+            "doc_id": w["doc_id"],
+            "version": w["version"],
+            "reason": w["reason"],
+            "withdrawn_at": w["withdrawn_at"],
+        }
+
+    @app.post("/documents/{doc_id}/publications/{version}/withdrawal",
+              status_code=201)
+    def withdraw_publication(doc_id: str, version: int, body: WithdrawalRequest) -> Any:
+        # 撤回记录的"查重 -> 插入"与发布共用 BEGIN IMMEDIATE 写事务，
+        # 与并发的单份/批次发布互斥串行；(doc_id, version) 主键保证重复
+        # 撤回只会留下首次记录，原因永不被改写。撤回只追加记录，不删除
+        # publications 行（版本号不复用），也不删除已落盘成品（生效前
+        # 已开始的下载因此可以完成）。
+        with write_tx(settings.db_path) as conn:
+            _get_publication(conn, doc_id, version)  # 未知文档/版本按既有错误返回
+            prior = _get_withdrawal(conn, doc_id, version)
+            if prior is not None:
+                # 重复撤回：返回首次记录，本次原因（即便不同/为空）一律忽略
+                return JSONResponse(
+                    content=_withdrawal_out(prior),
+                    status_code=200,
+                )
+            if not body.reason.strip():
+                _error(
+                    400,
+                    "reason_required",
+                    "withdrawal reason must not be empty",
+                )
+            now = _utcnow()
+            conn.execute(
+                "INSERT INTO publication_withdrawals (doc_id, version, reason,"
+                " withdrawn_at) VALUES (?,?,?,?)",
+                (doc_id, version, body.reason.strip(), now),
+            )
+            record = _get_withdrawal(conn, doc_id, version)
+        return _withdrawal_out(record)
+
+    @app.get("/documents/{doc_id}/publications/{version}/withdrawal")
+    def get_withdrawal(doc_id: str, version: int) -> dict:
+        with read_tx(settings.db_path) as conn:
+            _get_publication(conn, doc_id, version)  # 未知文档/版本按既有错误返回
+            w = _get_withdrawal(conn, doc_id, version)
+            if w is None:
+                _error(
+                    404,
+                    "withdrawal_not_found",
+                    f"publication version {version} of document '{doc_id}'"
+                    " has not been withdrawn",
+                )
+            return _withdrawal_out(w)
 
     # ---------------- 批次发布（整批原子） ----------------
 
@@ -597,16 +692,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f"publication batch '{batch_id}' does not exist",
                 )
             rows = conn.execute(
-                "SELECT position, doc_id, version, annotation_revision,"
-                " original_sha256, output_sha256"
-                " FROM batch_publications WHERE batch_id = ? ORDER BY position",
+                "SELECT bp.position, bp.doc_id, bp.version, bp.annotation_revision,"
+                " bp.original_sha256, bp.output_sha256,"
+                " w.withdrawn_at IS NOT NULL AS withdrawn, w.withdrawn_at"
+                " FROM batch_publications bp"
+                " LEFT JOIN publication_withdrawals w"
+                " ON w.doc_id = bp.doc_id AND w.version = bp.version"
+                " WHERE bp.batch_id = ? ORDER BY bp.position",
                 (batch_id,),
             ).fetchall()
         return {
             "batch_id": batch["id"],
             "created_at": batch["created_at"],
             "count": len(rows),
-            "documents": [dict(r) for r in rows],  # 顺序与原请求一致
+            "documents": [_pub_list_item(r) for r in rows],  # 顺序与原请求一致
         }
 
     # ---------------- 公开读取（只暴露发布版，不暴露原图） ----------------
@@ -631,10 +730,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return pub
 
+    def _require_not_withdrawn(conn: Any, doc_id: str, version: int) -> None:
+        """公开读取闸门：撤回生效后新发起的元数据/图片读取一律 410。
+
+        不返回成品摘要与遮盖详情；撤回记录仍在（撤回时间可经撤回查询获得）。
+        生效前已开始的图片下载在其自己的读事务中早已通过本闸门，
+        且成品文件不被撤回删除，因此可以完成。
+        """
+        w = conn.execute(
+            "SELECT withdrawn_at FROM publication_withdrawals"
+            " WHERE doc_id = ? AND version = ?",
+            (doc_id, version),
+        ).fetchone()
+        if w is not None:
+            _error(
+                410,
+                "version_withdrawn",
+                f"publication version {version} of document '{doc_id}' has been"
+                " permanently withdrawn and is no longer publicly available",
+                withdrawn_at=w["withdrawn_at"],
+            )
+
     @app.get("/publications/{doc_id}/{version}")
     def get_publication(doc_id: str, version: int) -> dict:
         with read_tx(settings.db_path) as conn:
             pub = _get_publication(conn, doc_id, version)
+            _require_not_withdrawn(conn, doc_id, version)
             rects = conn.execute(
                 "SELECT x, y, w, h, reason FROM annotation_rects"
                 " WHERE doc_id = ? AND revision = ? ORDER BY idx",
@@ -654,7 +775,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_publication_image(doc_id: str, version: int) -> FileResponse:
         with read_tx(settings.db_path) as conn:
             pub = _get_publication(conn, doc_id, version)
-        path = pub["output_path"]
+            _require_not_withdrawn(conn, doc_id, version)
+            path = pub["output_path"]
         if not os.path.exists(path):
             _error(
                 500,
